@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""
+M_get: Download audio from yt-dlp supported sites without using cookies.
+"""
+
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unicodedata
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse
+
+
+TARGET_I = -16.0
+TARGET_TP = -1.5
+TARGET_LRA = 11.0
+DEFAULT_OUTPUT_DIR = str(Path.home() / "Music" / "Music" / "Media.localized" / "Music" / "Download")
+DEFAULT_URL_FILE = Path(__file__).resolve().parent / "url.md"
+DEFAULT_LOG_FILE = Path(__file__).resolve().parent / "download_log.md"
+
+
+class MGetError(Exception):
+    pass
+
+
+def run_command(cmd: List[str], *, capture: bool = False) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            cmd,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+        )
+    except FileNotFoundError as exc:
+        raise MGetError(f"command not found: {cmd[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        if capture:
+            message = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise MGetError(message) from exc
+        raise MGetError(f"{Path(cmd[0]).name} exited with status {exc.returncode}") from exc
+
+
+def yt_dlp_command() -> List[str]:
+    binary = shutil.which("yt-dlp")
+    if binary:
+        return [binary]
+
+    probe = subprocess.run(
+        [sys.executable, "-m", "yt_dlp", "--version"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if probe.returncode == 0:
+        return [sys.executable, "-m", "yt_dlp"]
+
+    raise MGetError(
+        "yt-dlp is required. Install it with one of:\n"
+        "  brew install yt-dlp\n"
+        "  python3 -m pip install -U yt-dlp"
+    )
+
+
+def require_tool(name: str, install_hint: str) -> str:
+    path = shutil.which(name)
+    if not path:
+        raise MGetError(f"{name} is required. Install it with: {install_hint}")
+    return path
+
+
+def is_youtube_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    host = host[4:] if host.startswith("www.") else host
+    return host in {
+        "youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+        "youtu.be",
+        "youtube-nocookie.com",
+    } or host.endswith(".youtube.com")
+
+
+def canonicalize_url(url: str) -> str:
+    if not is_youtube_url(url):
+        return url
+
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    host = host[4:] if host.startswith("www.") else host
+    path = parsed.path.rstrip("/")
+
+    if host == "youtu.be":
+        video_id = parsed.path.strip("/").split("/")[0]
+    elif path == "/watch":
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        video_id = query.get("v", "")
+    elif path.startswith("/shorts/") or path.startswith("/live/"):
+        video_id = path.strip("/").split("/")[1]
+    else:
+        return url
+
+    if not video_id:
+        return url
+    return f"https://www.youtube.com/watch?{urlencode({'v': video_id})}"
+
+
+def extract_urls_from_text(text: str) -> List[str]:
+    urls = []
+    for match in re.finditer(r"https?://[^\s<>\"')\]]+", text):
+        urls.append(match.group(0).rstrip(".,;"))
+    return urls
+
+
+def read_url_file(path: Path) -> List[str]:
+    if not path.exists():
+        raise MGetError(f"URL file not found: {path}")
+    urls = extract_urls_from_text(path.read_text(encoding="utf-8"))
+    if not urls:
+        raise MGetError(f"no URLs found in URL file: {path}")
+    return urls
+
+
+def remove_url_from_file(path: Path, downloaded_url: str) -> None:
+    if not path.exists():
+        return
+
+    original = path.read_text(encoding="utf-8")
+    lines = original.splitlines(keepends=True)
+    kept_lines = []
+    changed = False
+
+    for line in lines:
+        urls = extract_urls_from_text(line)
+        matches = [url for url in urls if canonicalize_url(url) == downloaded_url]
+        if not matches:
+            kept_lines.append(line)
+            continue
+
+        changed = True
+        updated = line
+        for matched_url in sorted(matches, key=len, reverse=True):
+            updated = updated.replace(matched_url, "")
+        if updated.strip():
+            kept_lines.append(updated)
+
+    if changed:
+        path.write_text("".join(kept_lines), encoding="utf-8")
+        print(f"removed from URL file: {downloaded_url}")
+
+
+def dedupe_urls(urls: List[str]) -> List[str]:
+    seen = set()
+    result = []
+    for url in urls:
+        canonical = canonicalize_url(url)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        result.append(canonical)
+    return result
+
+
+def js_runtime_status() -> Tuple[Optional[str], List[str]]:
+    runtimes = []
+    for name in ("deno", "node", "bun"):
+        path = shutil.which(name)
+        if path:
+            runtimes.append(f"{name} ({path})")
+    return (runtimes[0] if runtimes else None, runtimes)
+
+
+def sanitize_filename(title: str, fallback: str = "audio", max_len: int = 180) -> str:
+    value = unicodedata.normalize("NFKC", title or "").strip()
+    value = re.sub(r"[\x00-\x1f\x7f/\\?%*:|\"<>]", "_", value)
+    value = re.sub(r"\s+", " ", value)
+    value = re.sub(r"_+", "_", value)
+    value = value.strip(" ._")
+    if not value:
+        value = fallback
+    if len(value) > max_len:
+        value = value[:max_len].rstrip(" ._")
+    return value or fallback
+
+
+def unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    for i in range(2, 1000):
+        candidate = parent / f"{stem} ({i}){suffix}"
+        if not candidate.exists():
+            return candidate
+    raise MGetError(f"could not create a unique filename for {path}")
+
+
+def dump_info(yt_dlp: List[str], url: str) -> dict:
+    cmd = [
+        *yt_dlp,
+        "--dump-single-json",
+        "--no-warnings",
+        "--no-cookies",
+        "--no-cookies-from-browser",
+        "--skip-download",
+    ]
+    cmd.append("--no-playlist")
+    cmd.append(url)
+    result = run_command(cmd, capture=True)
+    return json.loads(result.stdout)
+
+
+def find_downloaded_audio(temp_dir: Path) -> Path:
+    files = [p for p in temp_dir.iterdir() if p.is_file() and not p.name.endswith(".part")]
+    media_files = [p for p in files if p.suffix.lower() not in {".json", ".jpg", ".jpeg", ".png", ".webp"}]
+    if not media_files:
+        raise MGetError("yt-dlp completed but no audio file was found")
+    return max(media_files, key=lambda p: p.stat().st_mtime)
+
+
+def download_audio(
+    yt_dlp: List[str],
+    url: str,
+    temp_dir: Path,
+    audio_format: str,
+) -> Path:
+    cmd = [
+        *yt_dlp,
+        "--no-cookies",
+        "--no-cookies-from-browser",
+        "-f",
+        "bestaudio/best",
+        "--extract-audio",
+        "--audio-format",
+        audio_format,
+        "--audio-quality",
+        "0",
+        "--paths",
+        str(temp_dir),
+        "--output",
+        "download.%(ext)s",
+    ]
+    cmd.append("--no-playlist")
+    cmd.append(url)
+    run_command(cmd)
+    return find_downloaded_audio(temp_dir)
+
+
+def ffmpeg_loudnorm_first_pass(ffmpeg: str, source: Path) -> dict:
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-nostats",
+        "-i",
+        str(source),
+        "-af",
+        f"loudnorm=I={TARGET_I}:TP={TARGET_TP}:LRA={TARGET_LRA}:print_format=json",
+        "-f",
+        "null",
+        "-",
+    ]
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if proc.returncode != 0:
+        raise MGetError(proc.stderr.strip() or "ffmpeg loudness analysis failed")
+
+    match = re.search(r"\{\s*\"input_i\".*?\}", proc.stderr, re.DOTALL)
+    if not match:
+        raise MGetError("could not parse ffmpeg loudnorm analysis output")
+    return json.loads(match.group(0))
+
+
+def ffmpeg_normalize(ffmpeg: str, source: Path, dest: Path) -> None:
+    stats = ffmpeg_loudnorm_first_pass(ffmpeg, source)
+    measured = {
+        "measured_I": stats["input_i"],
+        "measured_TP": stats["input_tp"],
+        "measured_LRA": stats["input_lra"],
+        "measured_thresh": stats["input_thresh"],
+        "offset": stats["target_offset"],
+    }
+    filter_args = ":".join(
+        [
+            f"I={TARGET_I}",
+            f"TP={TARGET_TP}",
+            f"LRA={TARGET_LRA}",
+            *(f"{key}={value}" for key, value in measured.items()),
+            "linear=true",
+            "print_format=summary",
+        ]
+    )
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-y",
+        "-i",
+        str(source),
+        "-af",
+        f"loudnorm={filter_args}",
+        "-map_metadata",
+        "0",
+        str(dest),
+    ]
+    run_command(cmd)
+
+
+def move_or_normalize(ffmpeg: str, source: Path, dest: Path, normalize: bool) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest = unique_path(dest)
+    if normalize:
+        normalized = source.with_name(f"normalized{source.suffix}")
+        ffmpeg_normalize(ffmpeg, source, normalized)
+        shutil.move(str(normalized), str(dest))
+    else:
+        shutil.move(str(source), str(dest))
+    print(f"saved: {dest}")
+    return dest
+
+
+def markdown_table_cell(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
+
+def append_download_log(log_file: Path, title: str, url: str, saved_path: Path) -> None:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    if not log_file.exists() or log_file.stat().st_size == 0:
+        log_file.write_text(
+            "# M_get Download Log\n\n"
+            "| Date | Name | URL | File |\n"
+            "| --- | --- | --- | --- |\n",
+            encoding="utf-8",
+        )
+
+    row = "| {date} | {title} | {url} | {path} |\n".format(
+        date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        title=markdown_table_cell(title),
+        url=markdown_table_cell(url),
+        path=markdown_table_cell(str(saved_path)),
+    )
+    with log_file.open("a", encoding="utf-8") as handle:
+        handle.write(row)
+    print(f"logged: {log_file}")
+
+
+def print_check() -> int:
+    failures = 0
+    checks = [
+        ("yt-dlp", bool(shutil.which("yt-dlp")), "brew install yt-dlp"),
+        ("ffmpeg", bool(shutil.which("ffmpeg")), "brew install ffmpeg"),
+        ("python3", bool(shutil.which("python3")), "macOS usually includes python3, or install with brew install python"),
+        ("jq", bool(shutil.which("jq")), "optional: brew install jq"),
+    ]
+    for name, ok, hint in checks:
+        marker = "ok" if ok else "missing"
+        print(f"{name}: {marker}")
+        if not ok and name != "jq":
+            print(f"  {hint}")
+            failures += 1
+        elif not ok:
+            print(f"  {hint}")
+
+    selected, runtimes = js_runtime_status()
+    if selected:
+        print(f"JavaScript runtime: ok - {', '.join(runtimes)}")
+    else:
+        print("JavaScript runtime: missing - install deno, node, or bun for future YouTube requirements")
+    return 1 if failures else 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="M_get",
+        description="Download audio from yt-dlp supported sites without using cookies.",
+    )
+    parser.add_argument("url", nargs="*", help="video URL(s) supported by yt-dlp")
+    parser.add_argument(
+        "--url-file",
+        default=None,
+        help=f"markdown/text file containing URLs; defaults to {DEFAULT_URL_FILE} when no URL is given",
+    )
+    parser.add_argument("--log-file", default=str(DEFAULT_LOG_FILE), help="markdown file to append download logs")
+    parser.add_argument("-o", "--output-dir", default=DEFAULT_OUTPUT_DIR, help="directory to save audio files")
+    parser.add_argument(
+        "--format",
+        default="best",
+        choices=["best", "m4a", "mp3", "opus", "flac", "wav"],
+        help="audio container/codec to write; 'best' keeps the best available audio where possible",
+    )
+    parser.add_argument("--normalize", action="store_true", help="apply two-pass EBU R128 loudness normalization")
+    parser.add_argument("--check", action="store_true", help="check dependencies and exit")
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.check:
+        return print_check()
+
+    try:
+        direct_urls = dedupe_urls(list(args.url))
+        file_url_path = None
+        file_urls = []
+        if args.url_file:
+            file_url_path = Path(args.url_file).expanduser().resolve()
+            file_urls = dedupe_urls(read_url_file(file_url_path))
+        elif not direct_urls:
+            file_url_path = DEFAULT_URL_FILE.resolve()
+            file_urls = dedupe_urls(read_url_file(file_url_path))
+
+        input_urls = dedupe_urls(direct_urls + file_urls)
+        file_url_set = set(file_urls)
+        if not input_urls:
+            parser.error("URL is required unless --check is used")
+
+        yt_dlp = yt_dlp_command()
+        ffmpeg = require_tool("ffmpeg", "brew install ffmpeg")
+        output_dir = Path(args.output_dir).expanduser().resolve()
+        log_file = Path(args.log_file).expanduser().resolve()
+
+        for url in input_urls:
+            if is_youtube_url(url):
+                selected, _ = js_runtime_status()
+                if selected:
+                    print(f"YouTube JavaScript runtime check: {selected}")
+                else:
+                    print(
+                        "warning: no JavaScript runtime found. This works today, but future "
+                        "yt-dlp YouTube downloads may require Deno, Node.js, or Bun.",
+                        file=sys.stderr,
+                    )
+
+            info = dump_info(yt_dlp, url)
+            title = info.get("title") or info.get("id") or "audio"
+            fallback = f"audio_{info.get('id')}" if info.get("id") else "audio"
+            safe_name = sanitize_filename(title, fallback=fallback)
+
+            with tempfile.TemporaryDirectory(prefix="M_get_") as raw_tmp:
+                temp_dir = Path(raw_tmp)
+                downloaded = download_audio(yt_dlp, url, temp_dir, args.format)
+                dest = output_dir / f"{safe_name}{downloaded.suffix}"
+                saved_path = move_or_normalize(ffmpeg, downloaded, dest, args.normalize)
+                append_download_log(log_file, title, url, saved_path)
+                if file_url_path and url in file_url_set:
+                    remove_url_from_file(file_url_path, url)
+    except (MGetError, json.JSONDecodeError) as exc:
+        print(f"M_get: {exc}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

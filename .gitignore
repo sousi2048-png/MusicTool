@@ -1,0 +1,25 @@
+# Local queues and logs
+url.md
+download_log.md
+normalize_log.md
+
+# Generated backups and media
+.M_norm_backup/
+*.mp3
+*.m4a
+*.aac
+*.opus
+*.ogg
+*.flac
+*.wav
+*.wave
+*.aiff
+*.aif
+*.webm
+
+# Python/cache
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

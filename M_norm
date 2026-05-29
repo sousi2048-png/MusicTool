@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""
+M_norm: Normalize local audio files toward Spotify playback loudness.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+
+DEFAULT_LOG_FILE = Path(__file__).resolve().parent / "normalize_log.md"
+DEFAULT_BACKUP_DIRNAME = ".M_norm_backup"
+
+SUPPORTED_EXTENSIONS = {
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".opus",
+    ".ogg",
+    ".flac",
+    ".wav",
+    ".wave",
+    ".aiff",
+    ".aif",
+    ".webm",
+}
+
+TARGETS = {
+    "normal": (-14.0, -1.0, 11.0),
+    "quiet": (-19.0, -1.0, 11.0),
+    "loud": (-11.0, -1.0, 11.0),
+}
+
+
+class MNormError(Exception):
+    pass
+
+
+def run_command(cmd: List[str], *, capture: bool = False) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            cmd,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+        )
+    except FileNotFoundError as exc:
+        raise MNormError(f"command not found: {cmd[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        if capture:
+            message = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise MNormError(message) from exc
+        raise MNormError(f"{Path(cmd[0]).name} exited with status {exc.returncode}") from exc
+
+
+def require_tool(name: str, install_hint: str) -> str:
+    path = shutil.which(name)
+    if not path:
+        raise MNormError(f"{name} is required. Install it with: {install_hint}")
+    return path
+
+
+def parse_float(value: str) -> float:
+    if value in {"inf", "+inf", "-inf"}:
+        raise MNormError(f"invalid loudnorm value: {value}")
+    return float(value)
+
+
+def markdown_table_cell(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
+
+def unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    for index in range(2, 1000):
+        candidate = parent / f"{stem} ({index}){suffix}"
+        if not candidate.exists():
+            return candidate
+    raise MNormError(f"could not create a unique filename for {path}")
+
+
+def discover_audio_files(paths: List[Path], recursive: bool) -> List[Path]:
+    files = []
+    for path in paths:
+        resolved = path.expanduser().resolve()
+        if resolved.is_file():
+            if resolved.suffix.lower() in SUPPORTED_EXTENSIONS:
+                files.append(resolved)
+            continue
+        if resolved.is_dir():
+            iterator = resolved.rglob("*") if recursive else resolved.glob("*")
+            for candidate in iterator:
+                if (
+                    candidate.is_file()
+                    and candidate.suffix.lower() in SUPPORTED_EXTENSIONS
+                    and DEFAULT_BACKUP_DIRNAME not in candidate.parts
+                ):
+                    files.append(candidate.resolve())
+            continue
+        raise MNormError(f"path not found: {path}")
+    return sorted(dict.fromkeys(files))
+
+
+def analysis_pass(ffmpeg: str, source: Path, target_i: float, target_tp: float, target_lra: float) -> Dict[str, str]:
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-nostats",
+        "-i",
+        str(source),
+        "-af",
+        f"loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:print_format=json",
+        "-f",
+        "null",
+        "-",
+    ]
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if proc.returncode != 0:
+        raise MNormError(proc.stderr.strip() or f"ffmpeg analysis failed: {source}")
+    match = re.search(r"\{\s*\"input_i\".*?\}", proc.stderr, re.DOTALL)
+    if not match:
+        raise MNormError(f"could not parse loudnorm analysis: {source}")
+    return json.loads(match.group(0))
+
+
+def codec_args_for(path: Path) -> List[str]:
+    suffix = path.suffix.lower()
+    if suffix == ".mp3":
+        return ["-c:a", "libmp3lame", "-q:a", "2"]
+    if suffix in {".m4a", ".aac"}:
+        return ["-c:a", "aac", "-b:a", "256k"]
+    if suffix in {".opus", ".ogg", ".webm"}:
+        return ["-c:a", "libopus", "-b:a", "160k"]
+    if suffix == ".flac":
+        return ["-c:a", "flac", "-compression_level", "8"]
+    if suffix in {".wav", ".wave"}:
+        return ["-c:a", "pcm_s16le"]
+    if suffix in {".aiff", ".aif"}:
+        return ["-c:a", "pcm_s16be"]
+    raise MNormError(f"unsupported output extension: {path.suffix}")
+
+
+def normalize_pass(
+    ffmpeg: str,
+    source: Path,
+    dest: Path,
+    stats: Dict[str, str],
+    target_i: float,
+    target_tp: float,
+    target_lra: float,
+) -> None:
+    measured = {
+        "measured_I": stats["input_i"],
+        "measured_TP": stats["input_tp"],
+        "measured_LRA": stats["input_lra"],
+        "measured_thresh": stats["input_thresh"],
+        "offset": stats["target_offset"],
+    }
+    filter_args = ":".join(
+        [
+            f"I={target_i}",
+            f"TP={target_tp}",
+            f"LRA={target_lra}",
+            *(f"{key}={value}" for key, value in measured.items()),
+            "linear=true",
+            "print_format=summary",
+        ]
+    )
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-nostats",
+        "-y",
+        "-i",
+        str(source),
+        "-map_metadata",
+        "0",
+        "-vn",
+        "-af",
+        f"loudnorm={filter_args}",
+        *codec_args_for(source),
+        str(dest),
+    ]
+    run_command(cmd, capture=True)
+
+
+def backup_path_for(source: Path, roots: List[Path], backup_dir: Optional[Path]) -> Path:
+    if backup_dir:
+        root = backup_dir.expanduser().resolve()
+        try:
+            relative = source.relative_to(common_root(roots))
+        except ValueError:
+            relative = Path(source.name)
+        return unique_path(root / relative)
+
+    for root in roots:
+        root = root if root.is_dir() else root.parent
+        try:
+            relative = source.relative_to(root)
+            return unique_path(root / DEFAULT_BACKUP_DIRNAME / relative)
+        except ValueError:
+            continue
+    return unique_path(source.parent / DEFAULT_BACKUP_DIRNAME / source.name)
+
+
+def common_root(paths: List[Path]) -> Path:
+    resolved = [path.expanduser().resolve() for path in paths]
+    dirs = [path if path.is_dir() else path.parent for path in resolved]
+    common = Path(os.path.commonpath([str(path) for path in dirs]))
+    return common
+
+
+def replace_with_backup(source: Path, normalized: Path, backup_path: Path) -> None:
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(backup_path))
+    shutil.move(str(normalized), str(source))
+
+
+def append_log(
+    log_file: Path,
+    source: Path,
+    backup_path: Optional[Path],
+    before_i: float,
+    before_tp: float,
+    target_i: float,
+    target_tp: float,
+    status: str,
+) -> None:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    if not log_file.exists() or log_file.stat().st_size == 0:
+        log_file.write_text(
+            "# M_norm Normalize Log\n\n"
+            "| Date | File | Before LUFS | Before TP | Target LUFS | Target TP | Backup | Status |\n"
+            "| --- | --- | --- | --- | --- | --- | --- | --- |\n",
+            encoding="utf-8",
+        )
+    row = "| {date} | {file} | {before_i:.2f} | {before_tp:.2f} | {target_i:.2f} | {target_tp:.2f} | {backup} | {status} |\n".format(
+        date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        file=markdown_table_cell(str(source)),
+        before_i=before_i,
+        before_tp=before_tp,
+        target_i=target_i,
+        target_tp=target_tp,
+        backup=markdown_table_cell(str(backup_path)) if backup_path else "",
+        status=markdown_table_cell(status),
+    )
+    with log_file.open("a", encoding="utf-8") as handle:
+        handle.write(row)
+
+
+def should_skip(stats: Dict[str, str], target_i: float, target_tp: float, tolerance: float) -> Tuple[bool, float, float]:
+    before_i = parse_float(stats["input_i"])
+    before_tp = parse_float(stats["input_tp"])
+    loudness_ok = abs(before_i - target_i) <= tolerance
+    true_peak_ok = before_tp <= target_tp + 0.1
+    return loudness_ok and true_peak_ok, before_i, before_tp
+
+
+def process_file(
+    ffmpeg: str,
+    source: Path,
+    roots: List[Path],
+    backup_dir: Optional[Path],
+    log_file: Path,
+    target_i: float,
+    target_tp: float,
+    target_lra: float,
+    tolerance: float,
+    dry_run: bool,
+    force: bool,
+) -> str:
+    stats = analysis_pass(ffmpeg, source, target_i, target_tp, target_lra)
+    skip, before_i, before_tp = should_skip(stats, target_i, target_tp, tolerance)
+    if skip and not force:
+        print(f"skip: {source} ({before_i:.2f} LUFS, {before_tp:.2f} TP)")
+        if not dry_run:
+            append_log(log_file, source, None, before_i, before_tp, target_i, target_tp, "skipped: already near target")
+        return "skipped"
+
+    print(f"normalize: {source} ({before_i:.2f} LUFS, {before_tp:.2f} TP -> {target_i:.2f} LUFS)")
+    if dry_run:
+        return "dry-run"
+
+    backup_path = backup_path_for(source, roots, backup_dir)
+    with tempfile.TemporaryDirectory(prefix="M_norm_", dir=str(source.parent)) as raw_tmp:
+        temp_dir = Path(raw_tmp)
+        normalized = temp_dir / f"normalized{source.suffix}"
+        normalize_pass(ffmpeg, source, normalized, stats, target_i, target_tp, target_lra)
+        replace_with_backup(source, normalized, backup_path)
+    append_log(log_file, source, backup_path, before_i, before_tp, target_i, target_tp, "normalized")
+    return "normalized"
+
+
+def print_check() -> int:
+    failures = 0
+    for name, hint in [
+        ("ffmpeg", "brew install ffmpeg"),
+        ("ffprobe", "brew install ffmpeg"),
+        ("python3", "brew install python"),
+    ]:
+        ok = bool(shutil.which(name))
+        print(f"{name}: {'ok' if ok else 'missing'}")
+        if not ok:
+            print(f"  {hint}")
+            failures += 1
+    return 1 if failures else 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="M_norm",
+        description="Normalize local audio files toward Spotify loudness targets.",
+    )
+    parser.add_argument("path", nargs="*", help="audio file or directory to process")
+    parser.add_argument("--check", action="store_true", help="check dependencies and exit")
+    parser.add_argument("--dry-run", action="store_true", help="analyze files without writing output or logs")
+    parser.add_argument("--force", action="store_true", help="process even if a file is already near the target")
+    parser.add_argument("--no-recursive", action="store_true", help="do not recurse into subdirectories")
+    parser.add_argument(
+        "--target",
+        choices=sorted(TARGETS),
+        default="normal",
+        help="Spotify-like preset: normal=-14 LUFS, quiet=-19 LUFS, loud=-11 LUFS",
+    )
+    parser.add_argument("--lufs", type=float, default=None, help="custom integrated LUFS target")
+    parser.add_argument("--true-peak", type=float, default=None, help="custom true peak target")
+    parser.add_argument("--lra", type=float, default=None, help="custom loudness range target")
+    parser.add_argument("--tolerance", type=float, default=0.2, help="LUFS tolerance for skipping already-normalized files")
+    parser.add_argument("--log-file", default=str(DEFAULT_LOG_FILE), help="markdown file to append normalize logs")
+    parser.add_argument("--backup-dir", default=None, help="directory for backups; defaults to .M_norm_backup under each root")
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.check:
+        return print_check()
+    if not args.path:
+        parser.error("at least one file or directory path is required unless --check is used")
+
+    target_i, target_tp, target_lra = TARGETS[args.target]
+    if args.lufs is not None:
+        target_i = args.lufs
+    if args.true_peak is not None:
+        target_tp = args.true_peak
+    if args.lra is not None:
+        target_lra = args.lra
+
+    try:
+        ffmpeg = require_tool("ffmpeg", "brew install ffmpeg")
+        require_tool("ffprobe", "brew install ffmpeg")
+        input_paths = [Path(path) for path in args.path]
+        roots = [path.expanduser().resolve() for path in input_paths]
+        files = discover_audio_files(input_paths, recursive=not args.no_recursive)
+        if not files:
+            raise MNormError("no supported audio files found")
+
+        log_file = Path(args.log_file).expanduser().resolve()
+        backup_dir = Path(args.backup_dir).expanduser().resolve() if args.backup_dir else None
+        counts = {"normalized": 0, "skipped": 0, "dry-run": 0, "failed": 0}
+
+        for file_path in files:
+            try:
+                status = process_file(
+                    ffmpeg,
+                    file_path,
+                    roots,
+                    backup_dir,
+                    log_file,
+                    target_i,
+                    target_tp,
+                    target_lra,
+                    args.tolerance,
+                    args.dry_run,
+                    args.force,
+                )
+                counts[status] += 1
+            except Exception as exc:
+                counts["failed"] += 1
+                print(f"failed: {file_path}: {exc}", file=sys.stderr)
+
+        print(
+            "summary: "
+            f"normalized={counts['normalized']} "
+            f"skipped={counts['skipped']} "
+            f"dry-run={counts['dry-run']} "
+            f"failed={counts['failed']}"
+        )
+        return 1 if counts["failed"] else 0
+    except (MNormError, json.JSONDecodeError) as exc:
+        print(f"M_norm: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
