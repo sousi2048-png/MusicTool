@@ -4,6 +4,7 @@ MusicTool is a small set of command line tools for managing local music files:
 
 - `M_get`: download audio from YouTube, NicoNico, and other sites supported by `yt-dlp`
 - `M_norm`: normalize local audio files toward Spotify-like loudness so local tracks do not sound much louder or quieter than streamed tracks
+- `M_mp3`: convert audio files in a directory to MP3 without deleting the originals
 
 The tools are written in Python and use `yt-dlp` and `ffmpeg` for the heavy lifting.
 
@@ -24,7 +25,7 @@ brew install yt-dlp ffmpeg jq deno
 Make the tools executable after cloning:
 
 ```sh
-chmod +x M_get M_norm
+chmod +x M_get M_norm M_mp3
 ```
 
 Check dependencies:
@@ -32,6 +33,7 @@ Check dependencies:
 ```sh
 ./M_get --check
 ./M_norm --check
+./M_mp3 --check
 ```
 
 ## M_get
@@ -227,6 +229,38 @@ Choose a custom log file:
 
 ```sh
 ./M_norm --log-file ./normalize_log.md /path/to/music
+```
+
+## M_mp3
+
+`M_mp3` scans a directory recursively and converts supported audio files to MP3 using
+the LAME VBR high-quality setting (`-q:a 2`). Original files are preserved, existing
+MP3 files are skipped, and existing output files are not overwritten by default.
+
+Convert a directory recursively, writing MP3 files next to their sources:
+
+```sh
+./M_mp3 /path/to/music
+```
+
+Preview conversions without writing files:
+
+```sh
+./M_mp3 --dry-run /path/to/music
+```
+
+Write converted files under a separate directory while preserving the source
+directory structure:
+
+```sh
+./M_mp3 -o /path/to/mp3-output /path/to/music
+```
+
+Scan only the specified directory or explicitly replace existing output files:
+
+```sh
+./M_mp3 --no-recursive /path/to/music
+./M_mp3 --overwrite /path/to/music
 ```
 
 ## Notes
