@@ -96,11 +96,12 @@ Supported output formats:
 
 Downloads are normalized by default to Spotify Normal loudness: **-14 LUFS**,
 with a **-1 dBTP** true-peak target. This uses two-pass FFmpeg normalization
-and re-encodes the audio (48 kHz, explicit codec quality settings). Encoded output is measured before saving: loudness must be within 0.2 LU of
--14 LUFS and True Peak at or below -1 dBTP. If encoding causes an overshoot,
-the tool retries from the original download (up to three encodes); if verification
-still fails, it reports an error without publishing the output. Existing library files are not modified.
-The source loudness range is preserved where linear normalization is possible.
+and re-encodes the audio (48 kHz, explicit codec quality settings).
+Like `M_norm`, it measures the input once and then performs one normalization
+encode, with targets of -14 LUFS, -1 dBTP and LRA 11 LU (`linear=true`).
+There is no post-encode measurement, strict output-value check or retry.
+Lossy encoding can cause small deviations from the targets. Existing library
+files are not modified.
 
 `--normalize` remains supported, but is no longer necessary:
 

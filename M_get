@@ -265,8 +265,7 @@ def ffmpeg_loudnorm_first_pass(ffmpeg: str, source: Path) -> dict:
     return json.loads(match.group(0))
 
 
-def ffmpeg_normalize(ffmpeg: str, source: Path, dest: Path, *, _peak_target: float = TARGET_TP,
-                     _offset_adjustment: float = 0.0, _attempt: int = 0) -> None:
+def ffmpeg_normalize(ffmpeg: str, source: Path, dest: Path) -> None:
     stats = ffmpeg_loudnorm_first_pass(ffmpeg, source)
     if not all(math.isfinite(float(stats[key])) for key in
                ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")):
@@ -278,13 +277,13 @@ def ffmpeg_normalize(ffmpeg: str, source: Path, dest: Path, *, _peak_target: flo
         "measured_TP": stats["input_tp"],
         "measured_LRA": stats["input_lra"],
         "measured_thresh": stats["input_thresh"],
-        "offset": str(float(stats["target_offset"]) + _offset_adjustment),
+        "offset": stats["target_offset"],
     }
     filter_args = ":".join(
         [
             f"I={TARGET_I}",
-            f"TP={_peak_target}",
-            f"LRA={max(TARGET_LRA, float(stats['input_lra']))}",
+            f"TP={TARGET_TP}",
+            f"LRA={TARGET_LRA}",
             *(f"{key}={value}" for key, value in measured.items()),
             "linear=true",
             "print_format=summary",
@@ -307,22 +306,6 @@ def ffmpeg_normalize(ffmpeg: str, source: Path, dest: Path, *, _peak_target: flo
         str(dest),
     ]
     run_command(cmd)
-    after = ffmpeg_loudnorm_first_pass(ffmpeg, dest)
-    loudness = float(after["input_i"])
-    peak = float(after["input_tp"])
-    if not math.isfinite(loudness) or not math.isfinite(peak):
-        raise MGetError("Normalized audio has no measurable loudness")
-    if abs(loudness - TARGET_I) > 0.2 or peak > TARGET_TP:
-        if _attempt >= 2:
-            raise MGetError(f"Normalization verification failed: {loudness:.2f} LUFS, {peak:.2f} dBTP; audio was not saved")
-        # 非可逆圧縮によるピーク上昇も測定し、常に元の取得音声から再生成する。
-        return ffmpeg_normalize(
-            ffmpeg, source, dest,
-            _peak_target=_peak_target - max(0.0, peak - TARGET_TP) - 0.2,
-            _offset_adjustment=_offset_adjustment + TARGET_I - loudness,
-            _attempt=_attempt + 1,
-        )
-    print(f"verified: {loudness:.2f} LUFS, {peak:.2f} dBTP", flush=True)
 
 
 def normalization_codec_args(source: Path) -> List[str]:
