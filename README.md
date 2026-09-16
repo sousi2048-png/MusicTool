@@ -12,14 +12,15 @@ The tools are written in Python and use `yt-dlp` and `ffmpeg` for the heavy lift
 
 - Python 3
 - `ffmpeg` and `ffprobe`
-- `yt-dlp` for `M_get`
+- `uv` for the project-managed `yt-dlp` and EJS dependencies used by `M_get`
 - Optional: `jq`
-- Optional for future YouTube support: `deno`, `node`, or `bun`
+- `deno` (recommended) or `node` for YouTube support
 
 On macOS with Homebrew:
 
 ```sh
-brew install yt-dlp ffmpeg jq deno
+brew install ffmpeg jq deno
+uv sync
 ```
 
 Make the tools executable after cloning:
@@ -37,6 +38,22 @@ Check dependencies:
 ```
 
 ## M_get
+
+`M_get` runs yt-dlp from this project's uv environment, using `uv.lock` instead
+of a potentially outdated system installation. Install [uv](https://docs.astral.sh/uv/)
+before setup. The existing `./M_get URL` command works from any working directory.
+Personal yt-dlp configuration files are ignored so they cannot force an obsolete
+YouTube client. Deno and Node.js are explicitly enabled.
+`./M_get --check` displays the actual downloader version.
+
+To update after future YouTube changes, run these commands in the project directory:
+
+```sh
+uv lock --upgrade-package yt-dlp --upgrade-package yt-dlp-ejs
+uv sync
+./M_get --check
+```
+
 
 `M_get` downloads audio without using cookies. It asks `yt-dlp` for the best available audio stream, extracts audio with `ffmpeg`, creates a safe filename from the video title, and appends a Markdown download log.
 

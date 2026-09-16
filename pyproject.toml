@@ -1,0 +1,8 @@
+[project]
+name = "music-tool"
+version = "0.1.0"
+description = "Local audio download and conversion tools"
+requires-python = ">=3.12"
+dependencies = [
+    "yt-dlp[default]>=2026.8.19",
+]

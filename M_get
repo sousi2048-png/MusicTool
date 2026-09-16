@@ -48,24 +48,12 @@ def run_command(cmd: List[str], *, capture: bool = False) -> subprocess.Complete
 
 
 def yt_dlp_command() -> List[str]:
-    binary = shutil.which("yt-dlp")
-    if binary:
-        return [binary]
-
-    probe = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", "--version"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    if probe.returncode == 0:
-        return [sys.executable, "-m", "yt_dlp"]
-
-    raise MGetError(
-        "yt-dlp is required. Install it with one of:\n"
-        "  brew install yt-dlp\n"
-        "  python3 -m pip install -U yt-dlp"
-    )
+    uv = require_tool("uv", "https://docs.astral.sh/uv/getting-started/installation/")
+    return [
+        uv, "run", "--project", str(Path(__file__).resolve().parent),
+        "--locked", "python", "-m", "yt_dlp",
+        "--ignore-config", "--js-runtimes", "deno", "--js-runtimes", "node",
+    ]
 
 
 def require_tool(name: str, install_hint: str) -> str:
@@ -169,7 +157,7 @@ def dedupe_urls(urls: List[str]) -> List[str]:
 
 def js_runtime_status() -> Tuple[Optional[str], List[str]]:
     runtimes = []
-    for name in ("deno", "node", "bun"):
+    for name in ("deno", "node"):
         path = shutil.which(name)
         if path:
             runtimes.append(f"{name} ({path})")
@@ -350,10 +338,15 @@ def append_download_log(log_file: Path, title: str, url: str, saved_path: Path) 
 
 def print_check() -> int:
     failures = 0
+    try:
+        command = yt_dlp_command()
+        version = run_command([*command, "--version"], capture=True).stdout.strip()
+        print(f"yt-dlp: ok - {version} (project uv environment)")
+    except MGetError as exc:
+        print(f"yt-dlp: missing - {exc}")
+        failures += 1
     checks = [
-        ("yt-dlp", bool(shutil.which("yt-dlp")), "brew install yt-dlp"),
         ("ffmpeg", bool(shutil.which("ffmpeg")), "brew install ffmpeg"),
-        ("python3", bool(shutil.which("python3")), "macOS usually includes python3, or install with brew install python"),
         ("jq", bool(shutil.which("jq")), "optional: brew install jq"),
     ]
     for name, ok, hint in checks:
@@ -369,7 +362,7 @@ def print_check() -> int:
     if selected:
         print(f"JavaScript runtime: ok - {', '.join(runtimes)}")
     else:
-        print("JavaScript runtime: missing - install deno, node, or bun for future YouTube requirements")
+        print("JavaScript runtime: missing - install deno or node for YouTube support")
     return 1 if failures else 0
 
 
@@ -432,8 +425,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print(f"YouTube JavaScript runtime check: {selected}")
                 else:
                     print(
-                        "warning: no JavaScript runtime found. This works today, but future "
-                        "yt-dlp YouTube downloads may require Deno, Node.js, or Bun.",
+                        "warning: no JavaScript runtime found. Install Deno or Node.js "
+                        "for YouTube support.",
                         file=sys.stderr,
                     )
 
