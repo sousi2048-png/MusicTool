@@ -191,6 +191,8 @@ def normalize_pass(
         "-vn",
         "-af",
         f"loudnorm={filter_args}",
+        "-ar",
+        "48000",
         *codec_args_for(source),
         str(dest),
     ]
@@ -281,9 +283,34 @@ def process_file(
     tolerance: float,
     dry_run: bool,
     force: bool,
+    destination: Optional[Path] = None,
+    overwrite: bool = False,
 ) -> str:
+    if destination is not None and os.path.lexists(destination) and not overwrite:
+        print(f"skip (output exists): {destination}")
+        return "skipped"
     stats = analysis_pass(ffmpeg, source, target_i, target_tp, target_lra)
     skip, before_i, before_tp = should_skip(stats, target_i, target_tp, tolerance)
+    if destination is not None:
+        status = "copied" if skip and not force else "normalized"
+        print(f"{status}: {source} -> {destination} ({before_i:.2f} LUFS, {before_tp:.2f} TP)")
+        if dry_run:
+            return "dry-run"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".M_norm_", dir=str(destination.parent)) as raw_tmp:
+            staged = Path(raw_tmp) / destination.name
+            if status == "copied":
+                shutil.copy2(source, staged)
+            else:
+                normalize_pass(ffmpeg, source, staged, stats, target_i, target_tp, target_lra)
+            if overwrite:
+                os.replace(staged, destination)
+            else:
+                # 完成したファイルだけを公開し、並行実行時も既存出力を上書きしない。
+                os.link(staged, destination)
+        append_log(log_file, source, None, before_i, before_tp, target_i, target_tp,
+                   f"{status} -> {destination}")
+        return status
     if skip and not force:
         print(f"skip: {source} ({before_i:.2f} LUFS, {before_tp:.2f} TP)")
         if not dry_run:
@@ -328,6 +355,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check", action="store_true", help="check dependencies and exit")
     parser.add_argument("--dry-run", action="store_true", help="analyze files without writing output or logs")
     parser.add_argument("--force", action="store_true", help="process even if a file is already near the target")
+    parser.add_argument("-o", "--output-dir", help="write to a separate directory, preserving structure; requires one input directory")
+    parser.add_argument("--overwrite", action="store_true", help="replace existing output files (only with --output-dir)")
     parser.add_argument("--no-recursive", action="store_true", help="do not recurse into subdirectories")
     parser.add_argument(
         "--target",
@@ -352,6 +381,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return print_check()
     if not args.path:
         parser.error("at least one file or directory path is required unless --check is used")
+    if args.overwrite and not args.output_dir:
+        parser.error("--overwrite requires --output-dir")
+    if args.output_dir and (len(args.path) != 1 or args.backup_dir):
+        parser.error("--output-dir requires one input directory and cannot be combined with --backup-dir")
 
     target_i, target_tp, target_lra = TARGETS[args.target]
     if args.lufs is not None:
@@ -366,13 +399,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         require_tool("ffprobe", "brew install ffmpeg")
         input_paths = [Path(path) for path in args.path]
         roots = [path.expanduser().resolve() for path in input_paths]
+        output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else None
+        if output_dir is not None:
+            root = roots[0]
+            if not root.is_dir():
+                raise MNormError("--output-dir requires an input directory")
+            if root == output_dir or root in output_dir.parents or output_dir in root.parents:
+                raise MNormError("input and output directories must be separate, non-overlapping trees")
         files = discover_audio_files(input_paths, recursive=not args.no_recursive)
         if not files:
             raise MNormError("no supported audio files found")
 
         log_file = Path(args.log_file).expanduser().resolve()
         backup_dir = Path(args.backup_dir).expanduser().resolve() if args.backup_dir else None
-        counts = {"normalized": 0, "skipped": 0, "dry-run": 0, "failed": 0}
+        destinations = {}
+        if output_dir is not None:
+            for source in files:
+                try:
+                    destination = output_dir / source.relative_to(roots[0])
+                except ValueError:
+                    raise MNormError(f"audio symlink points outside input directory: {source}")
+                resolved_destination = destination.resolve()
+                if output_dir not in resolved_destination.parents:
+                    raise MNormError(f"output symlink points outside output directory: {destination}")
+                destinations[source] = destination
+        counts = {"normalized": 0, "copied": 0, "skipped": 0, "dry-run": 0, "failed": 0}
 
         for file_path in files:
             try:
@@ -388,6 +439,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     args.tolerance,
                     args.dry_run,
                     args.force,
+                    destinations.get(file_path),
+                    args.overwrite,
                 )
                 counts[status] += 1
             except Exception as exc:
@@ -397,6 +450,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(
             "summary: "
             f"normalized={counts['normalized']} "
+            f"copied={counts['copied']} "
             f"skipped={counts['skipped']} "
             f"dry-run={counts['dry-run']} "
             f"failed={counts['failed']}"

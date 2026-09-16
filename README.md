@@ -235,6 +235,30 @@ Disable recursive directory scanning:
 ./M_norm --no-recursive /path/to/music
 ```
 
+### Write normalized audio to another directory
+
+```sh
+./M_norm -o /path/to/normalized /path/to/original
+./M_norm --dry-run -o /path/to/normalized /path/to/original
+```
+
+`-o` / `--output-dir` accepts one input directory and preserves paths relative to
+that directory: `original/Artist/Album/song.mp3` becomes
+`normalized/Artist/Album/song.mp3`. Originals are never replaced or moved, so no
+backup copy is needed. Only supported audio files are exported; non-audio files
+and empty directories are not copied. Files already near the target are copied
+without re-encoding and reported as `copied`.
+
+Existing destination files are skipped. Use `--overwrite` to replace them, or
+`--force` to normalize even inputs already near the target. These options are
+independent. Complete output files are published only after successful processing.
+Input and output directory trees must not overlap. `--backup-dir` cannot be used
+with this mode. `--dry-run` writes no output, directories or logs.
+
+Normalization uses 48 kHz output to support Opus even when the loudnorm filter
+uses a higher internal sample rate. No post-encode measurement or retry is added.
+Without `-o`, the original in-place workflow with backups still applies.
+
 ### Backups and Logs
 
 `M_norm` does not delete the original file immediately. After a successful normalization, it moves the original file into a backup directory and puts the normalized file in the original location.
