@@ -5,6 +5,7 @@ M_get: Download audio from yt-dlp supported sites without using cookies.
 
 import argparse
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -17,8 +18,8 @@ from typing import List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse
 
 
-TARGET_I = -16.0
-TARGET_TP = -1.5
+TARGET_I = -14.0
+TARGET_TP = -1.0
 TARGET_LRA = 11.0
 DEFAULT_OUTPUT_DIR = str(Path.home() / "Music" / "Music" / "Media.localized" / "Music" / "Download")
 DEFAULT_URL_FILE = Path(__file__).resolve().parent / "url.md"
@@ -264,20 +265,26 @@ def ffmpeg_loudnorm_first_pass(ffmpeg: str, source: Path) -> dict:
     return json.loads(match.group(0))
 
 
-def ffmpeg_normalize(ffmpeg: str, source: Path, dest: Path) -> None:
+def ffmpeg_normalize(ffmpeg: str, source: Path, dest: Path, *, _peak_target: float = TARGET_TP,
+                     _offset_adjustment: float = 0.0, _attempt: int = 0) -> None:
     stats = ffmpeg_loudnorm_first_pass(ffmpeg, source)
+    if not all(math.isfinite(float(stats[key])) for key in
+               ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")):
+        raise MGetError("Cannot normalize audio with no measurable loudness")
+    print(f"normalize: {float(stats['input_i']):.2f} LUFS -> {TARGET_I:.2f} LUFS "
+          f"(true peak target: {TARGET_TP:.1f} dBTP)", flush=True)
     measured = {
         "measured_I": stats["input_i"],
         "measured_TP": stats["input_tp"],
         "measured_LRA": stats["input_lra"],
         "measured_thresh": stats["input_thresh"],
-        "offset": stats["target_offset"],
+        "offset": str(float(stats["target_offset"]) + _offset_adjustment),
     }
     filter_args = ":".join(
         [
             f"I={TARGET_I}",
-            f"TP={TARGET_TP}",
-            f"LRA={TARGET_LRA}",
+            f"TP={_peak_target}",
+            f"LRA={max(TARGET_LRA, float(stats['input_lra']))}",
             *(f"{key}={value}" for key, value in measured.items()),
             "linear=true",
             "print_format=summary",
@@ -293,9 +300,45 @@ def ffmpeg_normalize(ffmpeg: str, source: Path, dest: Path) -> None:
         f"loudnorm={filter_args}",
         "-map_metadata",
         "0",
+        "-vn",
+        "-ar",
+        "48000",
+        *normalization_codec_args(dest),
         str(dest),
     ]
     run_command(cmd)
+    after = ffmpeg_loudnorm_first_pass(ffmpeg, dest)
+    loudness = float(after["input_i"])
+    peak = float(after["input_tp"])
+    if not math.isfinite(loudness) or not math.isfinite(peak):
+        raise MGetError("Normalized audio has no measurable loudness")
+    if abs(loudness - TARGET_I) > 0.2 or peak > TARGET_TP:
+        if _attempt >= 2:
+            raise MGetError(f"Normalization verification failed: {loudness:.2f} LUFS, {peak:.2f} dBTP; audio was not saved")
+        # 非可逆圧縮によるピーク上昇も測定し、常に元の取得音声から再生成する。
+        return ffmpeg_normalize(
+            ffmpeg, source, dest,
+            _peak_target=_peak_target - max(0.0, peak - TARGET_TP) - 0.2,
+            _offset_adjustment=_offset_adjustment + TARGET_I - loudness,
+            _attempt=_attempt + 1,
+        )
+    print(f"verified: {loudness:.2f} LUFS, {peak:.2f} dBTP", flush=True)
+
+
+def normalization_codec_args(source: Path) -> List[str]:
+    """再エンコード時の暗黙の低ビットレートや非対応サンプルレートを避ける。"""
+    suffix = source.suffix.lower()
+    if suffix == ".mp3":
+        return ["-c:a", "libmp3lame", "-q:a", "2"]
+    if suffix in {".m4a", ".aac"}:
+        return ["-c:a", "aac", "-b:a", "256k"]
+    if suffix in {".opus", ".ogg", ".webm"}:
+        return ["-c:a", "libopus", "-b:a", "160k"]
+    if suffix == ".flac":
+        return ["-c:a", "flac"]
+    if suffix == ".wav":
+        return ["-c:a", "pcm_s16le"]
+    return []
 
 
 def move_or_normalize(ffmpeg: str, source: Path, dest: Path, normalize: bool) -> Path:
@@ -385,7 +428,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["best", "m4a", "mp3", "opus", "flac", "wav"],
         help="audio container/codec to write; 'best' keeps the best available audio where possible",
     )
-    parser.add_argument("--normalize", action="store_true", help="apply two-pass EBU R128 loudness normalization")
+    normalization = parser.add_mutually_exclusive_group()
+    normalization.add_argument("--normalize", dest="normalize", action="store_true", help="normalize to Spotify Normal (-14 LUFS, -1 dBTP); enabled by default")
+    normalization.add_argument("--no-normalize", dest="normalize", action="store_false", help="keep the downloaded audio's original loudness")
+    parser.set_defaults(normalize=True)
     parser.add_argument("--check", action="store_true", help="check dependencies and exit")
     return parser
 

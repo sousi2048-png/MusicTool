@@ -94,7 +94,15 @@ Supported output formats:
 - `flac`
 - `wav`
 
-Apply two-pass loudness normalization while downloading:
+Downloads are normalized by default to Spotify Normal loudness: **-14 LUFS**,
+with a **-1 dBTP** true-peak target. This uses two-pass FFmpeg normalization
+and re-encodes the audio (48 kHz, explicit codec quality settings). Encoded output is measured before saving: loudness must be within 0.2 LU of
+-14 LUFS and True Peak at or below -1 dBTP. If encoding causes an overshoot,
+the tool retries from the original download (up to three encodes); if verification
+still fails, it reports an error without publishing the output. Existing library files are not modified.
+The source loudness range is preserved where linear normalization is possible.
+
+`--normalize` remains supported, but is no longer necessary:
 
 ```sh
 ./M_get --normalize --format m4a "https://www.youtube.com/watch?v=VIDEO_ID"
@@ -104,6 +112,12 @@ Download multiple URLs:
 
 ```sh
 ./M_get URL1 URL2 URL3
+```
+
+Keep the source loudness when explicitly needed:
+
+```sh
+./M_get --no-normalize "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
 ### URL File Workflow
